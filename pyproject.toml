@@ -1,0 +1,21 @@
+[project]
+name = "duplicate-detection"
+version = "0.1.0"
+description = "Prototype duplicate detection service combining BM25, SimHash, and embeddings"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pandas",
+    "rank-bm25",
+    "sentence-transformers",
+    "scikit-learn",
+    "nltk",
+    "simhash",
+    "fastapi",
+    "uvicorn",
+    "requests",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"

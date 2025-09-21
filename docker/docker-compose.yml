@@ -1,0 +1,16 @@
+version: "3.9"
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: docker/app/Dockerfile
+    environment:
+      DUPLICATE_DATASET_DIR: /app/data/all_docs
+      DUPLICATE_MODEL: sentence-transformers/all-MiniLM-L6-v2
+      DUPLICATE_BM25_TOP_K: 200
+      DUPLICATE_MAX_CANDIDATES: 50
+      DUPLICATE_FEEDBACK_DB: sqlite:////app/data/feedback.db
+    volumes:
+      - ../data:/app/data
+    ports:
+      - "8000:8000"
