@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "pandas",
-    "rank-bm25",
+    "bm25s",
     "sentence-transformers",
     "scikit-learn",
     "nltk",

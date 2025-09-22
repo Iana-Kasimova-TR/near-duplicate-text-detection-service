@@ -1,40 +1,49 @@
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence, Tuple
+from typing import List, Optional, Sequence
 
-from rank_bm25 import BM25Okapi
+import bm25s
 
-from .models import DetectionConfig, Document
-from .preprocess import Preprocessor
+from .models import Chunk
 
 
 @dataclass
 class BM25Candidate:
-    doc: Document
+    chunk: Chunk
     score: float
 
 
 class BM25Repository:
-    def __init__(
-        self, documents: Sequence[Document], preprocessor: Preprocessor
-    ) -> None:
-        self.documents = list(documents)
-        self.preprocessor = preprocessor
-        self._corpus_tokens = [self._tokenize(doc) for doc in self.documents]
-        self.index = BM25Okapi(self._corpus_tokens)
+    def __init__(self, chunks: Sequence[Chunk]) -> None:
+        self.chunks = list(chunks)
+        self._tokenized_corpus = [list(chunk.tokens) for chunk in self.chunks]
+        self._retriever: Optional[bm25s.BM25] = None
+        if self._tokenized_corpus:
+            self._retriever = bm25s.BM25()
+            self._retriever.index(self._tokenized_corpus, show_progress=False)
 
-    def _tokenize(self, document: Document) -> List[str]:
-        normalized = self.preprocessor.normalize(document.text)
-        return self.preprocessor.tokenize(normalized).tokens
-
-    def query(self, text: str, top_k: int) -> List[BM25Candidate]:
-        normalized = self.preprocessor.normalize(text)
-        tokens = self.preprocessor.tokenize(normalized).tokens
-        scores = self.index.get_scores(tokens)
-        ranked: List[Tuple[int, float]] = sorted(
-            enumerate(scores), key=lambda t: t[1], reverse=True
-        )[:top_k]
-        return [
-            BM25Candidate(doc=self.documents[idx], score=float(score))
-            for idx, score in ranked
-            if score > 0
-        ]
+    def query(self, tokens: Sequence[str], top_k: int) -> List[BM25Candidate]:
+        if not tokens or self._retriever is None:
+            return []
+        corpus_size = len(self.chunks)
+        if corpus_size == 0:
+            return []
+        k = min(max(top_k, 0), corpus_size)
+        if k == 0:
+            return []
+        results = self._retriever.retrieve(
+            [list(tokens)],
+            k=k,
+            return_as="tuple",
+            show_progress=False,
+            leave_progress=False,
+            n_threads=0,
+            backend_selection="auto",
+        )
+        indices = results.documents[0].tolist()
+        scores = results.scores[0].tolist()
+        output: List[BM25Candidate] = []
+        for idx, score in zip(indices, scores):
+            if score <= 0:
+                continue
+            output.append(BM25Candidate(chunk=self.chunks[idx], score=float(score)))
+        return output

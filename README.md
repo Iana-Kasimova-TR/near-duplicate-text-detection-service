@@ -106,6 +106,22 @@ python scripts/generate_submission.py \
 - **Feedback loop** → We already capture `record_feedback`; wire that into your analytics, retrain thresholds, or build a small classifier to predict reviewer decisions.
 - **Nightly notifications** → Hook the batch job into your messaging stack so editors get a curated list of conflicts each morning.
 - **Persisted indexes** → Move embeddings to pgvector (or another vector DB) and SimHash/BM25 metadata to Postgres/Redis, then Dockerise the whole stack (`app`, `postgres+pgvector`, optional worker containers) for production.
+- **Partially duplicated** → Also it is really important to consider the case when documents are partially duplicated as it can also has bad influence on RAG performance
+
+## Key points
+- **User UI experience** → For better user UI experience I propose to show the duplication and difference as in we can see it when compare commits from Github. Also Notification to the user should be very soft, as we are not sure on 100 percent that is total duplicate
+- **Duplicates brings RAG app to downgrade in performance** → for RAG it is really crucial to avoid duplicates, as we will get from retrieval top k documents and these position can be busy by the same documents(as we have duplicates there)
+
+
+## Struggle
+
+Running BM25 over entire documents froze the submission script because every query reprocessed the full corpus; switching to chunk-level indexing, adopting `bm25s`, and reusing chunk embeddings finally made the pipeline responsive enough for near real-time checks.
+
+## Possible Solution
+
+- Break documents into chunks and index those chunks with `bm25s` so retrieval stays bounded and latency-friendly.
+- Cache the chunk embeddings alongside document vectors to reuse them during near real-time duplicate checks.
+- When upload volume spikes, buffer incoming chunks and trigger a batched rebuild once the queue crosses a threshold or a timed window, serving queries from the last full index plus the buffer until the refreshed index is swapped in.
 
 ## File Map
 

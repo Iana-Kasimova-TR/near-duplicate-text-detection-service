@@ -7,7 +7,7 @@ from simhash import Simhash
 from .bm25_index import BM25Repository
 from .embedder import Embedder
 from .feedback import save_feedback
-from .models import CandidateMatch, DetectionConfig, DetectionResult, Document
+from .models import CandidateMatch, Chunk, DetectionConfig, DetectionResult, Document
 from .preprocess import Preprocessor
 
 
@@ -18,6 +18,7 @@ class IndexedDocument:
     tokens: Sequence[str]
     simhash: int
     embedding_vector: Sequence[float]
+    chunk_ids: Sequence[str]
 
 
 @dataclass
@@ -26,6 +27,14 @@ class _PreparedDocument:
     normalized_text: str
     tokens: Sequence[str]
     simhash: int
+    embedding_vector: Sequence[float]
+    chunks: Sequence[Chunk]
+    chunk_vectors: Dict[str, Sequence[float]]
+
+
+@dataclass
+class IndexedChunk:
+    chunk: Chunk
     embedding_vector: Sequence[float]
 
 
@@ -43,30 +52,42 @@ class DuplicateDetectionService:
         self.preprocessor = Preprocessor(self.config)
 
         self._documents: Dict[str, IndexedDocument] = {}
+        self._chunks: Dict[str, IndexedChunk] = {}
+        self._document_chunks: Dict[str, List[str]] = {}
         self._bm25_repo: Optional[BM25Repository] = None
         self._initialize(list(documents))
 
     def _initialize(self, docs: List[Document]) -> None:
+        self._documents = {}
+        self._chunks = {}
+        self._document_chunks = {}
         if not docs:
-            self._bm25_repo = BM25Repository([], self.preprocessor)
+            self._refresh_bm25_repository()
             return
-
         normalized: Dict[str, str] = {}
         tokens_map: Dict[str, Sequence[str]] = {}
         simhash_map: Dict[str, int] = {}
-
+        all_chunks: List[Chunk] = []
+        chunks_per_doc: Dict[str, List[str]] = {}
         for doc in docs:
             norm_text, tokenized = self.preprocessor.prepare(doc)
             tokens = tokenized.tokens
             normalized[doc.doc_id] = norm_text
             tokens_map[doc.doc_id] = tokens
             simhash_map[doc.doc_id] = self._compute_simhash(tokens)
-
+            doc_chunks = list(self.preprocessor.chunk(doc, norm_text, tokenized))
+            chunks_per_doc[doc.doc_id] = [chunk.chunk_id for chunk in doc_chunks]
+            all_chunks.extend(doc_chunks)
         embeddings = {
             embedding.document.doc_id: embedding.vector
             for embedding in self.embedder.encode_documents(docs)
         }
-
+        chunk_embeddings = (
+            self.embedder.encode_chunks(all_chunks) if all_chunks else []
+        )
+        chunk_vectors = {
+            embedding.chunk.chunk_id: embedding.vector for embedding in chunk_embeddings
+        }
         for doc in docs:
             self._documents[doc.doc_id] = IndexedDocument(
                 document=doc,
@@ -74,9 +95,20 @@ class DuplicateDetectionService:
                 tokens=tokens_map[doc.doc_id],
                 simhash=simhash_map[doc.doc_id],
                 embedding_vector=embeddings[doc.doc_id],
+                chunk_ids=chunks_per_doc.get(doc.doc_id, []),
             )
+            self._document_chunks[doc.doc_id] = chunks_per_doc.get(doc.doc_id, [])
+        for chunk in all_chunks:
+            vector = chunk_vectors.get(chunk.chunk_id, [])
+            self._chunks[chunk.chunk_id] = IndexedChunk(
+                chunk=chunk,
+                embedding_vector=vector,
+            )
+        self._refresh_bm25_repository()
 
-        self._bm25_repo = BM25Repository(docs, self.preprocessor)
+    def _refresh_bm25_repository(self) -> None:
+        chunk_list = [self._chunks[key].chunk for key in sorted(self._chunks)]
+        self._bm25_repo = BM25Repository(chunk_list)
 
     @property
     def documents(self) -> Sequence[Document]:
@@ -89,15 +121,28 @@ class DuplicateDetectionService:
         prepared: Optional[_PreparedDocument] = None,
     ) -> None:
         prepared_doc = prepared or self._prepare_document(document)
+        old_chunk_ids = self._document_chunks.get(document.doc_id, [])
+        for chunk_id in old_chunk_ids:
+            self._chunks.pop(chunk_id, None)
         self._documents[document.doc_id] = IndexedDocument(
             document=document,
             normalized_text=prepared_doc.normalized_text,
             tokens=prepared_doc.tokens,
             simhash=prepared_doc.simhash,
             embedding_vector=prepared_doc.embedding_vector,
+            chunk_ids=[chunk.chunk_id for chunk in prepared_doc.chunks],
         )
+        self._document_chunks[document.doc_id] = [
+            chunk.chunk_id for chunk in prepared_doc.chunks
+        ]
+        for chunk in prepared_doc.chunks:
+            vector = prepared_doc.chunk_vectors.get(chunk.chunk_id, [])
+            self._chunks[chunk.chunk_id] = IndexedChunk(
+                chunk=chunk,
+                embedding_vector=vector,
+            )
         if recompute_index:
-            self._bm25_repo = BM25Repository(self.documents, self.preprocessor)
+            self._refresh_bm25_repository()
 
     def evaluate_document(
         self,
@@ -148,19 +193,56 @@ class DuplicateDetectionService:
         prepared: _PreparedDocument,
         include_self: bool,
     ) -> DetectionResult:
-        bm25_candidates = self._bm25_repo.query(
-            base_document.text, top_k=self.config.bm25_top_k
-        )
-        if not include_self:
-            bm25_candidates = [
-                candidate
-                for candidate in bm25_candidates
-                if candidate.doc.doc_id != base_document.doc_id
-            ]
+        if not prepared.chunks:
+            return DetectionResult(
+                candidates=[], evaluated_document_id=base_document.doc_id
+            )
+
+        doc_scores: Dict[str, float] = {}
+        doc_embedding_scores: Dict[str, float] = {}
+
+        for chunk in prepared.chunks:
+            tokens = list(chunk.tokens)
+            if not tokens:
+                continue
+            query_vector = prepared.chunk_vectors.get(chunk.chunk_id)
+            if query_vector is None or not query_vector:
+                query_vector = None
+            candidates = self._bm25_repo.query(tokens, self.config.bm25_top_k)
+            for candidate in candidates:
+                candidate_doc_id = candidate.chunk.doc_id
+                if not include_self and candidate_doc_id == base_document.doc_id:
+                    continue
+                doc_scores[candidate_doc_id] = (
+                    doc_scores.get(candidate_doc_id, 0.0) + candidate.score
+                )
+                if query_vector is None:
+                    continue
+                indexed_chunk = self._chunks.get(candidate.chunk.chunk_id)
+                if indexed_chunk is None:
+                    continue
+                candidate_vector = indexed_chunk.embedding_vector
+                if not candidate_vector:
+                    continue
+                score = self.embedder.cosine_similarity(query_vector, candidate_vector)
+                if score > doc_embedding_scores.get(candidate_doc_id, 0.0):
+                    doc_embedding_scores[candidate_doc_id] = score
+
+        if not doc_scores:
+            return DetectionResult(
+                candidates=[], evaluated_document_id=base_document.doc_id
+            )
+
+        ranked_doc_ids = [
+            doc_id
+            for doc_id, _ in sorted(
+                doc_scores.items(), key=lambda item: item[1], reverse=True
+            )
+        ][: self.config.bm25_top_k]
 
         matches: List[CandidateMatch] = []
-        for candidate in bm25_candidates:
-            indexed_candidate = self._documents.get(candidate.doc.doc_id)
+        for doc_id in ranked_doc_ids:
+            indexed_candidate = self._documents.get(doc_id)
             if indexed_candidate is None:
                 continue
 
@@ -177,8 +259,11 @@ class DuplicateDetectionService:
                 )
                 continue
 
-            embedding_similarity = self.embedder.cosine_similarity(
+            doc_level_similarity = self.embedder.cosine_similarity(
                 prepared.embedding_vector, indexed_candidate.embedding_vector
+            )
+            embedding_similarity = max(
+                doc_embedding_scores.get(doc_id, 0.0), doc_level_similarity
             )
             if embedding_similarity < self.config.embedding_threshold:
                 logging.debug(
@@ -194,7 +279,7 @@ class DuplicateDetectionService:
                 CandidateMatch(
                     doc_a=prepared.document,
                     doc_b=indexed_candidate.document,
-                    bm25_score=candidate.score,
+                    bm25_score=doc_scores.get(doc_id, 0.0),
                     simhash_similarity=simhash_similarity,
                     embedding_similarity=embedding_similarity,
                 )
@@ -228,12 +313,25 @@ class DuplicateDetectionService:
 
     def _prepare_from_index(self, doc_id: str) -> _PreparedDocument:
         indexed = self._documents[doc_id]
+        chunk_ids = self._document_chunks.get(doc_id, [])
+        chunks = [
+            self._chunks[chunk_id].chunk
+            for chunk_id in chunk_ids
+            if chunk_id in self._chunks
+        ]
+        chunk_vectors = {
+            chunk_id: self._chunks[chunk_id].embedding_vector
+            for chunk_id in chunk_ids
+            if chunk_id in self._chunks
+        }
         return _PreparedDocument(
             document=indexed.document,
             normalized_text=indexed.normalized_text,
             tokens=indexed.tokens,
             simhash=indexed.simhash,
             embedding_vector=indexed.embedding_vector,
+            chunks=chunks,
+            chunk_vectors=chunk_vectors,
         )
 
     def _prepare_document(self, document: Document) -> _PreparedDocument:
@@ -241,12 +339,19 @@ class DuplicateDetectionService:
         tokens = tokenized.tokens
         simhash_value = self._compute_simhash(tokens)
         embedding_vector = self.embedder.encode_documents([document])[0].vector
+        chunks = list(self.preprocessor.chunk(document, normalized_text, tokenized))
+        chunk_embeddings = self.embedder.encode_chunks(chunks) if chunks else []
+        chunk_vectors = {
+            embedding.chunk.chunk_id: embedding.vector for embedding in chunk_embeddings
+        }
         return _PreparedDocument(
             document=document,
             normalized_text=normalized_text,
             tokens=tokens,
             simhash=simhash_value,
             embedding_vector=embedding_vector,
+            chunks=chunks,
+            chunk_vectors=chunk_vectors,
         )
 
     def _compute_simhash(self, tokens: Sequence[str]) -> int:
