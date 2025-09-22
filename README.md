@@ -1,6 +1,5 @@
 # Duplicate Detection Prototype
-
-I rewired the service around a simple three-step pipeline: BM25 narrows the field, SimHash spots near duplicates fast, and sentence-transformer embeddings make the final call. Below is how everything fits together and what you can build on top of it.
+The service was built as a three-step pipeline: BM25 narrows the field, SimHash spots near duplicates fast, and sentence-transformer embeddings make sure that founded duplicates are true duplicates. Below is how everything fits together and what you can build on top of it.
 
 ## What Happens When Someone Uploads Content
 
@@ -8,7 +7,7 @@ I rewired the service around a simple three-step pipeline: BM25 narrows the fiel
    - normalises + tokenises the draft,
    - computes a SimHash fingerprint and an embedding *once*,
    - compares the draft against the cached corpus using **BM25 → SimHash → embeddings**.
-2. If the draft survives those checks, it’s added to the in-memory cache (SimHash + embedding). BM25 is still rebuilt by default, but you can defer that by setting `recompute_index=False` and refreshing in a nightly batch.
+2. If the draft survives those checks, it’s added to the in-memory cache (SimHash + embedding). BM25 is still rebuilt by default, but you can defer that by setting `recompute_index=False` and refreshing in a nightly batch(so that to tackle the issue with high computational costs for reindex BM25)
 3. Should the draft be rejected (duplicates found), nothing is persisted.
 
 So the editor always gets real-time feedback before publishing, without waiting for a nightly sweep.
@@ -27,8 +26,8 @@ At the end of the run, send a notification (email/Slack/etc.) summarising the fl
 
 ## Current Internals
 
-- **BM25 gate** – built once on startup; keeps candidate lists short. Rebuild after bulk ingests or during the nightly job.
-- **SimHash screening** – fingerprints cached per document; draft vs. candidate comparison is just XOR + popcount.
+- **BM25 gate** – built once on startup; keeps candidate lists short. Rebuild after bulk ingests or during the nightly job. Also we use here BM25s - it is more optimized modification for casual BM25 - https://huggingface.co/blog/xhluca/bm25s
+- **SimHash screening** – fingerprints cached per document; draft vs. candidate comparison is just XOR + popcount. Also in future can be repalced on modern approaches like MonoActive algorithm(weighted Jaccard distance)
 - **Embedding confirmation** – embeddings cached as well; cosine similarity via `Embedder.cosine_similarity` decides the final subset.
 - **Feedback capture** – call `DuplicateDetectionService.record_feedback()` to persist reviewer decisions in a SQLite database (see `duplicate_detection/feedback.py`). Example:
 
@@ -107,6 +106,7 @@ python scripts/generate_submission.py \
 - **Nightly notifications** → Hook the batch job into your messaging stack so editors get a curated list of conflicts each morning.
 - **Persisted indexes** → Move embeddings to pgvector (or another vector DB) and SimHash/BM25 metadata to Postgres/Redis, then Dockerise the whole stack (`app`, `postgres+pgvector`, optional worker containers) for production.
 - **Partially duplicated** → Also it is really important to consider the case when documents are partially duplicated as it can also has bad influence on RAG performance
+- **Build infrastructure** → make separate containers for vector storage, for storage of metadata and feedback users, also set up pipeline for retraining an algorithm for finding duplicates and keep versions of the algorithm
 
 ## Key points
 - **User UI experience** → For better user UI experience I propose to show the duplication and difference as in we can see it when compare commits from Github. Also Notification to the user should be very soft, as we are not sure on 100 percent that is total duplicate
